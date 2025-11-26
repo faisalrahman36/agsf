@@ -24,4 +24,7 @@ If using this then please cite:
 
 Please add link to this repo [https://github.com/faisalrahman36/agsf] too in citation.
 
+DOI: 10.5281/zenodo.17728545
+
+
 Please send feedback at: faisalrahman36@hotmail.com
