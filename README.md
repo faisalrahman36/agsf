@@ -22,6 +22,6 @@ If using this then please cite:
 
 **Rahman, S. F. (2025).** *AGSF: A  Probabilistic Source Finding Pipeline for Radio Interferometry using Gaussian Mixture Model (GMM). (In preparation)*.
 
-Please add link to this repo too in citation.
+Please add link to this repo [https://github.com/faisalrahman36/agsf] too in citation.
 
 Please send feedback at: faisalrahman36@hotmail.com
