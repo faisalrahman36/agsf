@@ -1,7 +1,8 @@
 '''
 Astronomy GMM Source Finder (AGSF)
 Author: Syed Faisal ur Rahman
-Version: 1.0
+
+
 '''
 
 import argparse
@@ -12,8 +13,6 @@ import sys
 import gc
 import json
 import os
-import shutil
-#from multiprocessing import cpu_count
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
@@ -22,11 +21,9 @@ from astropy.visualization import ZScaleInterval, ImageNormalize
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import detect_sources, SourceCatalog
 import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse  #, Rectangle
-#from matplotlib.lines import Line2D
+from matplotlib.patches import Ellipse
 
 # Core module
-# Please check Scikit-Learn GMM (https://scikit-learn.org/stable/modules/mixture.html)
 from sklearn.mixture import GaussianMixture
 from joblib import Parallel, delayed
 
@@ -39,40 +36,29 @@ except ImportError:
 
 warnings.filterwarnings('ignore')
 
-# --- DEFAULTS ---
-# These are default settings for the source finder. 
-
+# DEFAULTS 
 DEFAULT_CONFIG = {
-    "output_dir": "gmm_results",  #output directory
-    "save_plot": True,                # Whether to create plots
+    "output_dir": "gmm_results",
+    "save_plot": True,
+    "mosaic": True,
+    "tile_size": 2500,
+    "padding": 100,
+    "box_sizes": [100],
+    "detection_sigma": 5.0,
+    "min_pix": 5,
+    "n_jobs": -1,
+    "exclusion_radius": 5.0,
+    "max_components": 6,
     
-    # Large radio images (e.g., 10k x 10k pixels) consume GBs of RAM.
-    # We chop them into smaller "tiles" to process them efficiently.
-    "mosaic": True,                   # Process in tiled mode for big surveys like EMU ASKAP
-    
-    # Memory Optimization. 2500x2500 floats fits easily in CPU cache.
-    "tile_size": 2500,                # Each tile is 2500x2500 pixels
-    
-    # Edge Safety. Sources on the edge of a tile might get cut in half.
-    # We include a buffer zone to ensure we see the whole source.
-    "padding": 100,                   # Extra pixels around tiles to avoid cutting sources
-    
-    # Background Scale. 
-    "box_sizes": [100],               # Background estimation boxes (in pixels)
-    
-    # Sigma Threshold. 
-    "detection_sigma": 5.0,           # Threshold for detection
-    
-    # Beam Physics.
-    "min_pix": 5,                     # Minimum connected pixels to call it a source
-    "n_jobs": -1,                     # Use all available CPU cores (-1 means all)
-    "exclusion_radius": 5.0,  #Sources closer than this distance (in pixels) will be merged.
-    # If a source needs >6 components to fit, it is likely too 
-    # complex for this specific algorithm.
-    "max_components": 6               # Maximum number of Gaussians to fit to each island
+    # Hybrid De-blending & Dynamic Logic 
+    "multicomp_area_threshold": 2.0,
+    "multicomp_snr_override": 15.0,
+    "resample_factor": 100,
+    "min_samples": 500,
+    "max_samples": 10000
 }
 
-# --- SYSTEM SETUP ---
+# SYSTEM SETUP 
 def setup_environment(config_path, cli_no_mosaic):
     cfg = DEFAULT_CONFIG.copy()
     if config_path and os.path.exists(config_path):
@@ -95,41 +81,26 @@ def setup_environment(config_path, cli_no_mosaic):
 
 # --- UTILS ---
 def get_beam_info(header, pixel_scale):
-    """
-    The synthesized beam info.
-    
-    """
     try:
         bmaj = header['BMAJ']
         bmin = header['BMIN']
         bpa = header.get('BPA', 0.0)
         theta_maj = bmaj / pixel_scale
         theta_min = bmin / pixel_scale
-        # Area of a Gaussian = (pi * axis1 * axis2) / (4 * ln(2))
         beam_area = (np.pi * theta_maj * theta_min) / (4 * np.log(2))
         return bmaj, bmin, bpa, beam_area
     except KeyError:
         return 1.0/3600, 1.0/3600, 0.0, 1.0
 
 def deconvolve(maj, min, pa, bmaj, bmin, bpa):
-    """
-    Deconvolution.
-    Observed_Size^2 = True_Size^2 + Beam_Size^2.
-    We subtract the beam to find the true size of the galaxy.
-    """
     if maj < bmaj: return 0.0, 0.0, 0.0
     dc_maj = np.sqrt(max(0, maj**2 - bmaj**2))
     dc_min = np.sqrt(max(0, min**2 - bmin**2))
     return dc_maj, dc_min, pa
 
 def calculate_errors(flux_peak, flux_int, maj, min, local_rms, snr):
-    """
-    Key reference: Condon (1997) 'Errors in Elliptical Gaussian Fits'.
-    Calculates statistical uncertainties based on Signal-to-Noise Ratio (SNR).
-    """
     if snr <= 0: return 0, 0, 0, 0, 0, 0, 0
-    # rho = max(0.1, snr * np.sqrt(np.pi / (8 * np.log(2))))
-    # 1% calibration error floor (calculation uncertainty).
+    snr = max(snr, 0.1)
     err_peak = flux_peak * np.sqrt((1/snr)**2 + 0.01**2)
     err_int = flux_int * np.sqrt((1/snr)**2 + 0.01**2)
     err_maj = maj / snr
@@ -139,23 +110,20 @@ def calculate_errors(flux_peak, flux_int, maj, min, local_rms, snr):
     err_dec = min / (2*snr)
     return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
 
-# --- WORKER: GMM FITTER ---
+# GMM FITTER 
 def fit_island_worker(task):
-    """
-    Gaussian Mixture Model.
-    We treat pixel brightness as probability. The AI tries to find the best 
-    combination of Gaussian blobs to explain the image.
-    
-    """
     island_id = task['id']
     cutout = task['cutout']
     mask = task['mask']
-    rms = task['rms']
     wcs_slice = task['wcs']
     beam = task['beam']
     pix_scale = task['pix_scale']
     config = task['config']
     box_origin = task.get('box_origin', 0)
+
+    # Use passed RMS 
+    rms = task['rms']
+    if rms == 0 or np.isnan(rms): return []
 
     valid = (mask) & (~np.isnan(cutout))
     y, x = np.indices(cutout.shape)
@@ -164,27 +132,47 @@ def fit_island_worker(task):
     if len(flux_vals) < 5: return []
 
     X = np.vstack([x[valid], y[valid]]).T
-    weights = flux_vals / np.sum(flux_vals)
+    
+    # Dynamic Sampling
+    island_peak = np.max(flux_vals)
+    island_snr = island_peak / rms
+    n_dynamic = int(np.clip(island_snr * config.get('resample_factor', 100), 
+                            config.get('min_samples', 500), 
+                            config.get('max_samples', 10000)))
+    n_dynamic = min(n_dynamic, len(flux_vals) * 10)
+
+    weights = np.maximum(flux_vals, 0)
+    if np.sum(weights) == 0: return []
+    weights /= np.sum(weights)
+    
+    rng = np.random.default_rng(42)
+    X_samp = X[rng.choice(len(X), size=n_dynamic, p=weights)]
     
     bmaj, bmin, bpa, beam_area = beam
-    # [Heuristic]: If the source is smaller than 2 beams, it can't be resolved into multiple components. Force N=1.
-    max_comp = 1 if len(flux_vals) < (2.0 * beam_area) else config['max_components']
+    min_variance = 0.1 * beam_area 
 
-    rng = np.random.default_rng(42)
-    # GMM is slow (O(N^2)). Sampling 2000 points gives 99% accuracy but runs 100x faster.
-    n_samp = min(2000, len(flux_vals) * 5)
-    X_samp = X[rng.choice(len(X), size=n_samp, p=weights)]
-    
+    # Hybrid Logic
+    limit_threshold = config.get('multicomp_area_threshold', 2.0) * beam_area
+    snr_override = config.get('multicomp_snr_override', 15.0)
+
+    if len(flux_vals) >= limit_threshold or island_snr >= snr_override:
+        max_comp = config['max_components']
+    else:
+        max_comp = 1
+
     best_bic = np.inf
     best_gmm = None
     
-    # Try 1 Gaussian, then 2, then 3... use BIC to choose the simplest valid model.
     for n in range(1, max_comp + 1):
         try:
-            gmm = GaussianMixture(n_components=n, covariance_type='full', random_state=42)
+            gmm = GaussianMixture(n_components=n, 
+                                  covariance_type='full', 
+                                  reg_covar=min_variance,
+                                  random_state=42)
             gmm.fit(X_samp)
-            if gmm.bic(X_samp) < best_bic:
-                best_bic = gmm.bic(X_samp)
+            current_bic = gmm.bic(X_samp)
+            if current_bic < best_bic:
+                best_bic = current_bic
                 best_gmm = gmm
         except: continue
             
@@ -192,11 +180,8 @@ def fit_island_worker(task):
 
     comps = []
     
-    
     for i in range(best_gmm.n_components):
         mx, my = best_gmm.means_[i]
-        
-        # 1. Shape - Eigenvalues of covariance matrix give Major/Minor axes
         vals, vecs = np.linalg.eigh(best_gmm.covariances_[i])
         order = vals.argsort()[::-1]
         vals, vecs = vals[order], vecs[:, order]
@@ -204,37 +189,36 @@ def fit_island_worker(task):
         dy, dx = vecs[:, 0]
         pa = np.degrees(np.arctan2(dx, dy)) % 180
         
-        # Convert Gaussian Sigma (std dev) to FWHM (Full Width Half Max).
         maj_pix = np.sqrt(vals[0]) * 2.355
         min_pix = np.sqrt(vals[1]) * 2.355
         maj_deg = maj_pix * pix_scale
         min_deg = min_pix * pix_scale
         
-       
         comp_weight = best_gmm.weights_[i]
-        
         raw_int_flux_jy = (np.sum(flux_vals) / beam_area) * comp_weight
         
-     
-        # Geometric factor for the area of a Gaussian ellipse.
         gaussian_area_pix = 1.133 * maj_pix * min_pix
         peak_flux = raw_int_flux_jy / (gaussian_area_pix / beam_area)
         
-        # analytic_int_flux = peak_flux * (gaussian_area_pix / beam_area)
-        
-        final_int_flux = raw_int_flux_jy * 1.05 # 5% wing correction
-        
+         
+        if peak_flux < 1.0 * rms:
+            continue
+
         snr = peak_flux / rms
         dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
-        errs = calculate_errors(peak_flux, final_int_flux, maj_deg, min_deg, rms, snr)
+        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, rms, snr)
 
-        sky = wcs_slice.pixel_to_world(mx, my)
+        try:
+            sky = wcs_slice.pixel_to_world(mx, my)
+            ra_val, dec_val = sky.ra.deg, sky.dec.deg
+        except:
+            ra_val, dec_val = 0.0, 0.0
 
         comps.append({
             'Island_id': island_id,
-            'RA': sky.ra.deg, 'E_RA': errs[5],
-            'DEC': sky.dec.deg, 'E_DEC': errs[6],
-            'Total_flux': final_int_flux, 'E_Total_flux': errs[1],
+            'RA': ra_val, 'E_RA': errs[5],
+            'DEC': dec_val, 'E_DEC': errs[6],
+            'Total_flux': raw_int_flux_jy, 'E_Total_flux': errs[1],
             'Peak_flux': peak_flux, 'E_Peak_flux': errs[0],
             'Maj': maj_deg*3600, 'E_Maj': errs[2]*3600,
             'Min': min_deg*3600, 'E_Min': errs[3]*3600,
@@ -251,7 +235,6 @@ def detect_on_data(data, wcs, config, edge_info=None):
     
     for box in config['box_sizes']:
         try:
-            # Estimate background noise by iteratively removing foreground contamination.
             bkg = Background2D(data, (box, box), filter_size=(3, 3),
                                sigma_clip=SigmaClip(sigma=3.0), 
                                bkg_estimator=MedianBackground())
@@ -275,8 +258,19 @@ def detect_on_data(data, wcs, config, edge_info=None):
                     if (not is_top) and (cy > h - pad): continue
 
                 sl = source.slices
+                
+                try:
+                    maj_sigma = getattr(source.semimajor_sigma, 'value', source.semimajor_sigma)
+                    min_sigma = getattr(source.semiminor_sigma, 'value', source.semiminor_sigma)
+                    orientation = getattr(source.orientation, 'value', source.orientation)
+                    peak_val = source.max_value
+                except:
+                    maj_sigma, min_sigma, orientation, peak_val = np.nan, np.nan, np.nan, 0
+
                 cand = {
                     'cx': cx, 'cy': cy, 'flux': source.segment_flux,
+                    'peak': peak_val,
+                    'maj_sig': maj_sigma, 'min_sig': min_sigma, 'orient': orientation,
                     'cutout': sub[sl].copy(), 'mask': (segm.data[sl] == source.label),
                     'rms': rms[int(cy), int(cx)], 'wcs': wcs.slice(sl),
                     'box': box
@@ -288,10 +282,6 @@ def detect_on_data(data, wcs, config, edge_info=None):
     
     all_candidates.sort(key=lambda x: x['flux'], reverse=True)
     unique = []
-    # Assume you set exclusion_radius = 5 pixesl, then:
-    # Distance Filtering. sqrt(25) = 5 pixels. 
-    # If two sources are within 5 pixels (1 beam width), they are likely the same source.
-    # We keep the brightest and discard the duplicate.
     exclusion_sq = config['exclusion_radius']**2
 
     while all_candidates:
@@ -338,25 +328,45 @@ def run_mosaic(data, full_wcs, beam, scale, config, f_isl, f_comp, out_dir):
 
     print(f"\nMosaic Complete.")
     if config.get('save_plot', False) and all_components_for_plot:
-        # Don't if image is too large (>8000x8000) to avoid RAM crash.
         if data.size < 8000**2:
             plot_path = os.path.join(out_dir, "mosaic_plot.png")
             generate_production_plot(data, full_wcs, None, all_components_for_plot, plot_path, scale)
 
 def process_candidates(cands, beam, scale, config, f_isl, f_comp, group_id, append=False):
     if not cands: return []
-    _, _, _, beam_area = beam
+    bmaj, bmin, bpa, beam_area = beam
     island_list = []
     fit_tasks = []
     
     for i, cand in enumerate(cands):
         uid = f"{group_id}_{i+1}"
         sky = cand['wcs'].pixel_to_world(cand['cutout'].shape[1]//2, cand['cutout'].shape[0]//2)
+        
+        maj_deg = (cand['maj_sig'] * 2.355) * scale if not np.isnan(cand['maj_sig']) else 0
+        min_deg = (cand['min_sig'] * 2.355) * scale if not np.isnan(cand['min_sig']) else 0
+        pa = (90 - np.degrees(cand['orient'])) % 180 if not np.isnan(cand['orient']) else 0.0
+
+        total_flux_jy = cand['flux'] / beam_area
+        peak_flux_jy = cand['peak']
+        local_rms = cand['rms']
+        
+        isl_snr = peak_flux_jy / local_rms
+        errs = calculate_errors(peak_flux_jy, total_flux_jy, maj_deg, min_deg, local_rms, isl_snr)
+
         island_list.append({
-            'Island_id': uid, 'RA': sky.ra.deg, 'DEC': sky.dec.deg,
-            'Total_flux_Jy': cand['flux'] / beam_area, 'Isl_rms': cand['rms'],
+            'Island_id': uid, 
+            'RA': sky.ra.deg, 'E_RA': errs[5],
+            'DEC': sky.dec.deg, 'E_DEC': errs[6],
+            'Total_flux': total_flux_jy, 'E_Total_flux': errs[1],
+            'Peak_flux': peak_flux_jy, 'E_Peak_flux': errs[0],
+            'Maj': maj_deg*3600, 'E_Maj': errs[2]*3600,
+            'Min': min_deg*3600, 'E_Min': errs[3]*3600,
+            'PA': pa, 'E_PA': errs[4],
+            'Isl_rms': local_rms,
+            'BPA': bpa,
             'Detection_Box': cand['box']
         })
+        
         fit_tasks.append({
             'id': uid, 'cutout': cand['cutout'], 'mask': cand['mask'],
             'rms': cand['rms'], 'wcs': cand['wcs'], 'beam': beam,

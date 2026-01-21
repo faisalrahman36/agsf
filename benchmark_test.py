@@ -1,3 +1,12 @@
+'''
+This code is for testing purposes only. It compares results from Astronomy GMM Source Finder (AGSF) with PyBDSF. 
+Author: Syed Faisal ur Rahman
+Version: 1.0
+
+
+'''
+ 
+
 import os
 import sys
 import numpy as np
@@ -13,7 +22,7 @@ from astropy.visualization import ZScaleInterval, ImageNormalize
 import json
 
 # Import your GMM code
-import gmm_source_finder
+import gmm_source_finder_v3
 # --- CONFIGURATION ---
 FITS_FILE = "cosmos144MHz_zoom.fits"
 OUTPUT_DIR = "benchmark_full"
@@ -59,7 +68,7 @@ def run_gmm_full(fits_path):
     print(">>> RUNNING GMM-RADIO")
     print("="*40)
     
-    cfg = gmm_source_finder.DEFAULT_CONFIG.copy()
+    cfg = gmm_source_finder_v3.DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             cfg.update(json.load(f))
@@ -75,15 +84,15 @@ def run_gmm_full(fits_path):
     
     try: pscale = abs(wcs.wcs.cdelt[1])
     except: pscale = 1.0/3600.0
-    beam = gmm_source_finder.get_beam_info(header, pscale)
+    beam = gmm_source_finder_v3.get_beam_info(header, pscale)
     
     f_isl = os.path.join(OUTPUT_DIR, "gmm_islands.csv")
     f_comp = os.path.join(OUTPUT_DIR, "gmm_components.csv")
     
     if cfg['mosaic']:
-        gmm_source_finder.run_mosaic(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
+        gmm_source_finder_v3.run_mosaic(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
     else:
-        gmm_source_finder.run_standard(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
+        gmm_source_finder_v3.run_standard(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
     
     return f_comp
 
