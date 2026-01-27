@@ -9,6 +9,7 @@ import argparse
 import numpy as np
 import warnings
 import csv
+import sys
 import gc
 import json
 import os
@@ -296,8 +297,10 @@ def detect_on_data(data, wcs, config, edge_info=None):
     det_sigma = config.get('detection_sigma', 3.0)
     peak_sigma = config.get('peak_snr_sigma', 5.0)
 
+    # LOOP: Try every box size. If one fails, just skip it.
     for box in config['box_sizes']:
         try:
+            # Background Estimation
             bkg = Background2D(data, (box, box), filter_size=(3, 3),
                                sigma_clip=SigmaClip(sigma=3.0), 
                                bkg_estimator=MedianBackground())
@@ -313,11 +316,16 @@ def detect_on_data(data, wcs, config, edge_info=None):
             
             for source in cat:
                 # 3. Filter Noise (Check Peak > 5.0 sigma)
-                local_rms = rms[int(source.centroid[1]), int(source.centroid[0])]
+                # Ensure centroid is within image bounds for RMS lookup
+                cx_int, cy_int = int(min(w-1, max(0, source.centroid[0]))), int(min(h-1, max(0, source.centroid[1])))
+                local_rms = rms[cy_int, cx_int]
+                
                 if source.max_value < (peak_sigma * local_rms):
                     continue
 
                 cx, cy = source.centroid
+                
+                # Edge Padding Check
                 if edge_info:
                     is_left, is_right, is_bottom, is_top = edge_info
                     pad = config['padding']
@@ -328,6 +336,7 @@ def detect_on_data(data, wcs, config, edge_info=None):
 
                 sl = source.slices
                 
+                # Safely get shape parameters
                 try:
                     maj_sigma = getattr(source.semimajor_sigma, 'value', source.semimajor_sigma)
                     min_sigma = getattr(source.semiminor_sigma, 'value', source.semiminor_sigma)
@@ -345,10 +354,13 @@ def detect_on_data(data, wcs, config, edge_info=None):
                     'box': box
                 }
                 all_candidates.append(cand)
-        except: continue
+        except Exception as e:
+            # If this box size fails (e.g. too big), just ignore it and try the next one
+            continue
 
     if not all_candidates: return [], None
     
+    # Remove duplicates (keep the one with highest flux)
     all_candidates.sort(key=lambda x: x['flux'], reverse=True)
     unique = []
     exclusion_sq = config['exclusion_radius']**2
