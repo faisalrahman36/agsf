@@ -16,6 +16,7 @@ import os
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
+from astropy.stats import SigmaClip, mad_std
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import detect_sources, SourceCatalog
@@ -42,7 +43,7 @@ DEFAULT_CONFIG = {
     "mosaic": True,
     "tile_size": 2500,
     "padding": 100,
-    "box_sizes": [100],
+    "box_sizes": [50,100,250],
     
     # --- SENSITIVITY SETTINGS ---
     "detection_sigma": 3.0,   # Detect wings (match PyBDSF)
@@ -139,7 +140,7 @@ def deconvolve(maj, min_ax, pa, bmaj, bmin, bpa):
     dc_maj = np.sqrt(evals[0]) * 2.355
     dc_min = np.sqrt(evals[1]) * 2.355
     
-    # 6. Calculate PA from eigenvectors
+    # Calculate new PA from eigenvectors
     # Astronomical PA: angle of Major axis from North (Y) toward East (X is -RA)
     dx, dy = evecs[:, 0] # Major axis vector
     dc_pa = np.degrees(np.arctan2(dx, dy)) % 180
@@ -148,13 +149,13 @@ def deconvolve(maj, min_ax, pa, bmaj, bmin, bpa):
 
 def calculate_errors(flux_peak, flux_int, maj, min_ax, bmaj, bmin, snr):
     """
-    Calculates errors matching Condon (1997)
+    Calculates errors matching Condon (1997) approx used in text.
     Requires passing bmaj/bmin (beam) in addition to source params.
     """
     if snr <= 0: return 0, 0, 0, 0, 0, 0, 0
     snr = max(snr, 0.1)
     
-    # Position error depends on BEAM size
+    # Text Eq 16: Position error depends on BEAM size, not fitted size
     # Factor 2 is standard approx for Gaussian fit stability
     err_ra = bmaj / (2 * snr)
     err_dec = bmin / (2 * snr)
@@ -168,6 +169,18 @@ def calculate_errors(flux_peak, flux_int, maj, min_ax, bmaj, bmin, snr):
     err_min = min_ax / snr
     err_pa = 10.0 / snr
     
+    return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
+
+def calculate_errors(flux_peak, flux_int, maj, min, local_rms, snr):
+    if snr <= 0: return 0, 0, 0, 0, 0, 0, 0
+    snr = max(snr, 0.1)
+    err_peak = flux_peak * np.sqrt((1/snr)**2 + 0.01**2)
+    err_int = flux_int * np.sqrt((1/snr)**2 + 0.01**2)
+    err_maj = maj / snr
+    err_min = min / snr
+    err_pa = 10.0 / snr
+    err_ra = maj / (2*snr)
+    err_dec = min / (2*snr)
     return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
 
 # --- WORKER: GMM FITTER ---
@@ -266,7 +279,7 @@ def fit_island_worker(task):
 
         snr = peak_flux / rms
         dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
-        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, bmaj,bmin, snr)
+        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, rms, snr)
 
         try:
             sky = wcs_slice.pixel_to_world(mx, my)
@@ -297,10 +310,8 @@ def detect_on_data(data, wcs, config, edge_info=None):
     det_sigma = config.get('detection_sigma', 3.0)
     peak_sigma = config.get('peak_snr_sigma', 5.0)
 
-    # LOOP: Try every box size. If one fails, just skip it.
     for box in config['box_sizes']:
         try:
-            # Background Estimation
             bkg = Background2D(data, (box, box), filter_size=(3, 3),
                                sigma_clip=SigmaClip(sigma=3.0), 
                                bkg_estimator=MedianBackground())
@@ -316,16 +327,11 @@ def detect_on_data(data, wcs, config, edge_info=None):
             
             for source in cat:
                 # 3. Filter Noise (Check Peak > 5.0 sigma)
-                # Ensure centroid is within image bounds for RMS lookup
-                cx_int, cy_int = int(min(w-1, max(0, source.centroid[0]))), int(min(h-1, max(0, source.centroid[1])))
-                local_rms = rms[cy_int, cx_int]
-                
+                local_rms = rms[int(source.centroid[1]), int(source.centroid[0])]
                 if source.max_value < (peak_sigma * local_rms):
                     continue
 
                 cx, cy = source.centroid
-                
-                # Edge Padding Check
                 if edge_info:
                     is_left, is_right, is_bottom, is_top = edge_info
                     pad = config['padding']
@@ -336,7 +342,6 @@ def detect_on_data(data, wcs, config, edge_info=None):
 
                 sl = source.slices
                 
-                # Safely get shape parameters
                 try:
                     maj_sigma = getattr(source.semimajor_sigma, 'value', source.semimajor_sigma)
                     min_sigma = getattr(source.semiminor_sigma, 'value', source.semiminor_sigma)
@@ -354,13 +359,10 @@ def detect_on_data(data, wcs, config, edge_info=None):
                     'box': box
                 }
                 all_candidates.append(cand)
-        except Exception as e:
-            # If this box size fails (e.g. too big), just ignore it and try the next one
-            continue
+        except: continue
 
     if not all_candidates: return [], None
     
-    # Remove duplicates (keep the one with highest flux)
     all_candidates.sort(key=lambda x: x['flux'], reverse=True)
     unique = []
     exclusion_sq = config['exclusion_radius']**2
@@ -432,7 +434,7 @@ def process_candidates(cands, beam, scale, config, f_isl, f_comp, group_id, appe
         local_rms = cand['rms']
         
         isl_snr = peak_flux_jy / local_rms
-        errs = calculate_errors(peak_flux_jy, total_flux_jy, maj_deg, min_deg, bmaj,bmin, isl_snr)
+        errs = calculate_errors(peak_flux_jy, total_flux_jy, maj_deg, min_deg, local_rms, isl_snr)
 
         island_list.append({
             'Island_id': uid, 
