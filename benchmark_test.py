@@ -1,12 +1,6 @@
 '''
-This code is for testing purposes only. It compares results from Astronomy GMM Source Finder (AGSF) with PyBDSF. 
-Author: Syed Faisal ur Rahman
-Version: 1.0
-
-
+AGSF vs PyBDSF Benchmark 
 '''
- 
-
 import os
 import sys
 import numpy as np
@@ -18,32 +12,31 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 from astropy import units as u
+from astropy.wcs.utils import proj_plane_pixel_scales
 from astropy.visualization import ZScaleInterval, ImageNormalize
 import json
 
-# Import your GMM code
-import gmm_source_finder_v3
+# Import GMM code
+import gmm_source_finder as gmm_tool
+
 # --- CONFIGURATION ---
 FITS_FILE = "cosmos144MHz_zoom.fits"
-OUTPUT_DIR = "benchmark_full"
-PYBDSF_THRESH_PIX = 5.0
-PYBDSF_THRESH_ISL = 3.0
+OUTPUT_DIR = "benchmark_final"
 CONFIG_FILE = "config.json"
 
 def setup_dirs():
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
-# --- 1. RUN PYBDSF (Sources Only) ---
-def run_pybdsf_full(fits_path):
-    print("\n" + "="*40)
-    print(">>> RUNNING PYBDSF")
-    print("="*40)
+# --- 1. RUN PYBDSF (GAUSSIANS) ---
+def run_pybdsf_gaussians(fits_path):
+    print(f"\n>>> RUNNING PYBDSF on {fits_path}")
     try:
+        # Match thresholds to GMM config
         img = bdsf.process_image(
             fits_path,
-            thresh_pix=PYBDSF_THRESH_PIX,
-            thresh_isl=PYBDSF_THRESH_ISL,
+            thresh_pix=5.0, # peak_snr_sigma in GMM
+            thresh_isl=3.0, # detection_sigma in GMM
             adaptive_thresh=True,
             rms_box=(150, 50),
             atrous_do=False,
@@ -52,23 +45,21 @@ def run_pybdsf_full(fits_path):
             quiet=True
         )
         
-        # Export ONLY Source List (srl) - safest option
-        srl_file = os.path.join(OUTPUT_DIR, "pybdsf_sources.csv")
-        img.write_catalog(outfile=srl_file, catalog_type='srl', format='csv', clobber=True)
+        # Export 'gaul' (Gaussians) for GMM components comparison
+        gau_file = os.path.join(OUTPUT_DIR, "pybdsf_gaussians.csv")
+        img.write_catalog(outfile=gau_file, catalog_type='gaul', format='csv', clobber=True)
         
-        print(f"PyBDSF Found: {img.nsrc} Sources")
-        return srl_file
+        print(f"PyBDSF Found: {img.nsrc} Sources, {len(img.gaussians)} Gaussians")
+        return gau_file
     except Exception as e:
         print(f"Error running PyBDSF: {e}")
         return None
 
-# --- 2. RUN GMM-RADIO (Islands + Components) ---
+# --- 2. RUN GMM-RADIO ---
 def run_gmm_full(fits_path):
-    print("\n" + "="*40)
-    print(">>> RUNNING GMM-RADIO")
-    print("="*40)
+    print(f"\n>>> RUNNING GMM-RADIO on {fits_path}")
     
-    cfg = gmm_source_finder_v3.DEFAULT_CONFIG.copy()
+    cfg = gmm_tool.DEFAULT_CONFIG.copy()
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, 'r') as f:
             cfg.update(json.load(f))
@@ -76,200 +67,133 @@ def run_gmm_full(fits_path):
     cfg['output_dir'] = OUTPUT_DIR
     cfg['save_plot'] = False 
     
+    # Run the GMM pipeline
+    
     hdul = fits.open(fits_path)
     header = hdul[0].header
     data = np.squeeze(hdul[0].data)
     wcs = WCS(header).celestial
     if data.ndim > 2: data = data[0] if data.ndim == 3 else data[0,0]
     
-    try: pscale = abs(wcs.wcs.cdelt[1])
-    except: pscale = 1.0/3600.0
-    beam = gmm_source_finder_v3.get_beam_info(header, pscale)
+    # Robust Pixel Scale
+    pix_scales = proj_plane_pixel_scales(wcs)
+    pscale = pix_scales[0] # Degrees
+    
+    beam = gmm_tool.get_beam_info(header, pscale)
     
     f_isl = os.path.join(OUTPUT_DIR, "gmm_islands.csv")
     f_comp = os.path.join(OUTPUT_DIR, "gmm_components.csv")
     
-    if cfg['mosaic']:
-        gmm_source_finder_v3.run_mosaic(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
+    if cfg.get('mosaic', True):
+        gmm_tool.run_mosaic(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
     else:
-        gmm_source_finder_v3.run_standard(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
+        gmm_tool.run_standard(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
     
     return f_comp
 
-# --- ROBUST READER ---
-def read_catalog_smart(filename):
-    """
-    Reads PyBDSF catalogs handling variable headers and comments.
-    """
-    try:
-        # 1. Find Header Line
-        header_row = 0
-        with open(filename, 'r') as f:
-            lines = f.readlines()
-            
-        for i, line in enumerate(lines):
-            # Check for common PyBDSF column names
-            # Note: PyBDSF sometimes puts units in header like "RA (deg)"
-            if "Source_id" in line or "RA" in line:
-                header_row = i
-                break
-        
-        # 2. Read
-        # We treat '#' as a comment to avoid it being part of column names
-        # But we need to make sure we don't skip the header row if it starts with #
-        
-        # Try reading with 'header=header_row'
-        df = pd.read_csv(filename, header=header_row, skipinitialspace=True)
-        
-        # Clean up column names (remove # and spaces)
-        df.columns = [c.replace('#', '').strip() for c in df.columns]
-        
-        print(f"DEBUG: Columns found in {filename}: {list(df.columns)}")
-
-        # 3. Normalize Columns
-        col_map = {}
-        for col in df.columns:
-            c = col.upper()
-            # General Mappings
-            if 'RA' in c and 'ERR' not in c: col_map[col] = 'RA'
-            if 'DEC' in c and 'ERR' not in c: col_map[col] = 'DEC'
-            if 'TOTAL_FLUX' in c and 'ERR' not in c: col_map[col] = 'Total_flux'
-            if 'MAJ' in c and 'ERR' not in c: col_map[col] = 'Maj'
-            if 'MIN' in c and 'ERR' not in c: col_map[col] = 'Min'
-            if 'PA' in c and 'ERR' not in c: col_map[col] = 'PA'
-            
-        df.rename(columns=col_map, inplace=True)
-        
-        # Verify
-        if 'RA' not in df.columns:
-            print("CRITICAL ERROR: 'RA' column not found after mapping.")
-            # Fallback: Try to assume column positions for standard PyBDSF SRL
-            # Source_id, Isl_id, RA, E_RA, DEC, E_DEC, Total_flux, ...
-            if len(df.columns) >= 7:
-                print("Attempting positional mapping...")
-                df.rename(columns={df.columns[2]: 'RA', df.columns[4]: 'DEC', df.columns[6]: 'Total_flux'}, inplace=True)
-        
-        return df
-    except Exception as e:
-        print(f"Error reading catalog {filename}: {e}")
-        return pd.DataFrame()
-
-# --- COMPARISON LOGIC ---
+# --- 3. COMPARISON & PLOTTING ---
 def compare_catalogs(gmm_path, pyb_path, fits_path):
-    print(f"\n--- Comparing Components ---")
+    print(f"\n--- Comparing Catalogs ---")
     gmm = pd.read_csv(gmm_path)
-    pyb = read_catalog_smart(pyb_path)
     
-    if pyb.empty or gmm.empty:
-        print(f"Skipping Comparison (Empty/Missing File)")
+    # Robust PyBDSF Reader (Handles comments/headers)
+    try:
+        # Find header line starting with "Source_id" or "Gaus_id"
+        header_row = 0
+        with open(pyb_path, 'r') as f:
+            for i, line in enumerate(f):
+                if "RA" in line and "DEC" in line:
+                    header_row = i
+                    break
+        pyb = pd.read_csv(pyb_path, skiprows=header_row, skipinitialspace=True)
+        pyb.columns = [c.strip().replace('#', '') for c in pyb.columns] # Clean columns
+    except:
+        print("Failed to read PyBDSF catalog.")
         return
 
-    print(f"GMM Count:    {len(gmm)}")
-    print(f"PyBDSF Count: {len(pyb)}")
+    print(f"GMM Components:    {len(gmm)}")
+    print(f"PyBDSF Gaussians:  {len(pyb)}")
     
-    # Check if 'RA' exists now
-    if 'RA' not in pyb.columns:
-        print("Error: Could not identify RA column in PyBDSF file. Aborting match.")
-        return
-
-    # Matching
+    # Match Catalogues
     c_gmm = SkyCoord(ra=gmm['RA'].values*u.deg, dec=gmm['DEC'].values*u.deg)
     c_pyb = SkyCoord(ra=pyb['RA'].values*u.deg, dec=pyb['DEC'].values*u.deg)
     
     idx, d2d, _ = c_gmm.match_to_catalog_sky(c_pyb)
-    match_mask = d2d < 2.0 * u.arcsec # Match radius
+    match_mask = d2d < 1.0 * u.arcsec # Tight matching for components
     
     matches = gmm[match_mask].copy()
     matches['Ref_Flux'] = pyb.iloc[idx[match_mask]]['Total_flux'].values
+    matches['Ref_Peak'] = pyb.iloc[idx[match_mask]]['Peak_flux'].values
     
-    print(f"Matched:      {len(matches)}")
+    print(f"Matched Components: {len(matches)}")
     
-    # Plot Flux
+    # Plot 1: Flux Comparison
     plt.figure(figsize=(6, 6))
-    
-    # Scale to mJy if appropriate
-    scale = 1000.0
-    unit = "mJy"
-    if matches['Total_flux'].max() > 1.0: # If > 1 Jy, keep in Jy
-        scale = 1.0
-        unit = "Jy"
-
-    x = matches['Ref_Flux'] * scale
-    y = matches['Total_flux'] * scale
-    
-    plt.scatter(x, y, alpha=0.6, c='blue')
-    if len(x) > 0:
-        mx = max(x.max(), y.max())
-        mn = min(x.min(), y.min())
-        plt.plot([mn, mx], [mn, mx], 'r--')
-        
+    x = matches['Ref_Flux']
+    y = matches['Total_flux']
+    plt.scatter(x, y, alpha=0.5, s=10, c='blue', label='Total Flux')
+    plt.plot([min(x), max(x)], [min(x), max(x)], 'r--')
     plt.xscale('log'); plt.yscale('log')
-    plt.xlabel(f'PyBDSF Flux ({unit})'); plt.ylabel(f'GMM Flux ({unit})')
-    plt.title(f'Flux Comparison')
-    plt.savefig(os.path.join(OUTPUT_DIR, f"compare_flux.png"))
-    print(f"Saved plot: compare_flux.png")
-    
-    # Generate Overlay
-    plot_final_overlay(gmm, pyb, fits_path)
+    plt.xlabel('PyBDSF Flux (Jy)'); plt.ylabel('GMM Flux (Jy)')
+    plt.title('Flux Recovery (Gaussian to Gaussian)')
+    plt.savefig(os.path.join(OUTPUT_DIR, "flux_comparison.png"))
+    plt.close()
 
-def plot_final_overlay(gmm_comp, pyb_comp, fits_path):
-    print("\n--- Generating Master Overlay ---")
+    # Plot 2: Overlay
+    plot_overlay(gmm, pyb, fits_path)
+
+def plot_overlay(gmm, pyb, fits_path):
+    print("Generating Overlay Map...")
     with fits.open(fits_path) as hdul:
         data = np.squeeze(hdul[0].data)
         header = hdul[0].header
         wcs = WCS(header).celestial
         if data.ndim > 2: data = data[0] if data.ndim == 3 else data[0,0]
 
-    fig = plt.figure(figsize=(14, 14))
+    # Robust scale factor
+    pix_scales = proj_plane_pixel_scales(wcs)
+    deg_per_pix = pix_scales[0]
+
+    fig = plt.figure(figsize=(12, 12))
     ax = plt.subplot(projection=wcs)
     norm = ImageNormalize(data, interval=ZScaleInterval())
     ax.imshow(data, origin='lower', cmap='Greys', norm=norm)
     
-    # Helper to plot ellipse
-    def plot_cat(df, color, style, label, scale_factor=1.0):
-        for _, row in df.iterrows():
-            try:
-                x, y = wcs.world_to_pixel_values(row['RA'], row['DEC'])
-                maj = row['Maj'] * scale_factor
-                min = row['Min'] * scale_factor
-                e = Ellipse((x, y), width=min, height=maj, angle=row['PA']+90,
-                            edgecolor=color, facecolor='none', lw=1.5, linestyle=style)
-                ax.add_patch(e)
-            except: pass
-    
-    # Pixel Scale for conversion
-    try:
-        pix_scale = abs(header['CDELT2'])
-    except:
-        pix_scale = 1.0/3600.0
-    
-    # 1. PyBDSF Components (Green)
-    # PyBDSF Maj/Min are usually in DEGREES. We need pixels.
-    # Pixels = Degrees / PixelScale
-    if 'Maj' in pyb_comp.columns:
-        plot_cat(pyb_comp, 'lime', '-', 'PyBDSF', scale_factor=1.0/pix_scale)
-    
-    # 2. GMM Components (Red)
-    # GMM Maj/Min are in ARCSEC. We need pixels.
-    # Pixels = (Arcsec / 3600) / PixelScale
-    if 'Maj' in gmm_comp.columns:
-        plot_cat(gmm_comp, 'red', '--', 'GMM', scale_factor=(1.0/3600.0)/pix_scale)
+    # Plot PyBDSF (Lime)
+    # PyBDSF 'Maj'/'Min' are typically FWHM in DEGREES
+    for _, row in pyb.iterrows():
+        try:
+            x, y = wcs.world_to_pixel_values(row['RA'], row['DEC'])
+            maj_pix = row['Maj'] / deg_per_pix
+            min_pix = row['Min'] / deg_per_pix
+            e = Ellipse((x, y), width=min_pix, height=maj_pix, angle=row['PA']+90,
+                        edgecolor='lime', facecolor='none', lw=1.0)
+            ax.add_patch(e)
+        except: pass
 
+    # Plot GMM (Red)
+    # GMM 'Maj'/'Min' are FWHM in ARCSEC
+    for _, row in gmm.iterrows():
+        try:
+            x, y = wcs.world_to_pixel_values(row['RA'], row['DEC'])
+            maj_pix = (row['Maj'] / 3600.0) / deg_per_pix
+            min_pix = (row['Min'] / 3600.0) / deg_per_pix
+            e = Ellipse((x, y), width=min_pix, height=maj_pix, angle=row['PA']+90,
+                        edgecolor='red', facecolor='none', lw=1.0, linestyle='--')
+            ax.add_patch(e)
+        except: pass
+
+    # Legend
     from matplotlib.lines import Line2D
-    cl = [Line2D([0],[0], color='lime', lw=2), Line2D([0],[0], color='red', lw=2, ls='--')]
-    ax.legend(cl, ['PyBDSF', 'GMM-Radio'])
+    lines = [Line2D([0],[0], color='lime', lw=2), Line2D([0],[0], color='red', lw=2, ls='--')]
+    ax.legend(lines, ['PyBDSF (Gaussians)', 'GMM (Components)'])
     
-    plt.savefig(os.path.join(OUTPUT_DIR, "master_overlay.png"), dpi=200)
-    print("Saved master_overlay.png")
+    plt.savefig(os.path.join(OUTPUT_DIR, "overlay_map.png"), dpi=200)
+    plt.close()
 
-# --- MAIN DRIVER ---
 if __name__ == "__main__":
     setup_dirs()
-    
-    # 1. Run Tools
-    pyb_srl = run_pybdsf_full(FITS_FILE)
+    pyb_gau = run_pybdsf_gaussians(FITS_FILE)
     gmm_comp = run_gmm_full(FITS_FILE)
-    
-    # 2. Compare
-    if pyb_srl and gmm_comp:
-        compare_catalogs(gmm_comp, pyb_srl, FITS_FILE)
+    if pyb_gau and gmm_comp:
+        compare_catalogs(gmm_comp, pyb_gau, FITS_FILE)

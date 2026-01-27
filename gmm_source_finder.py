@@ -1,7 +1,7 @@
 '''
 Astronomy GMM Source Finder (AGSF)
 Author: Syed Faisal ur Rahman
-
+Version: 1.3 
 
 '''
 
