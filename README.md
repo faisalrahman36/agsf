@@ -27,3 +27,94 @@ Please add link to this repo [https://github.com/faisalrahman36/agsf] too in cit
 
 
 Please send feedback at: faisalrahman36@hotmail.com
+
+
+# AGSF Source Finder - User Guide
+
+**AGSF** (Astronomy GMM Source Finder) is a Python-based radio source finder that uses Gaussian Mixture Models to decompose complex astronomical sources. It is designed to match the sensitivity of industry standards (like PyBDSF) while providing robust de-blending for complex morphologies.
+
+### 1. Installation
+
+Ensure you have the required dependencies:
+
+```bash
+pip install numpy scipy astropy photutils scikit-learn matplotlib joblib
+
+```
+
+### 2. Usage
+
+Run the script from your terminal:
+
+**Standard Run (uses defaults):**
+
+```bash
+python gmm_source_finder.py my_image.fits
+
+```
+
+**Run with Config (Recommended):**
+
+```bash
+python gmm_source_finder.py my_image.fits --config config.json
+
+```
+
+---
+
+### 3. Configuration (`config.json`)
+
+Create a `config.json` file with these settings. This **"Deep Field" configuration** is optimized for high sensitivity and multi-scale background estimation.
+
+```json
+{
+    "output_dir": "gmm_results_optimized_v4",
+    "save_plot": true,
+    "mosaic": true,
+    "n_jobs": -1,
+
+    "detection_sigma": 3.0,
+    "peak_snr_sigma": 5.0,
+    "min_pix": 5,
+    "box_sizes": [50, 100, 250],
+
+    "multicomp_area_threshold": 2.0,
+    "multicomp_snr_override": 15.0,
+    "max_components": 6
+}
+
+```
+
+#### 🔧 Key Parameters Explained
+
+| Parameter | Recommended | Description & Use Case |
+| --- | --- | --- |
+| **`detection_sigma`** | **3.0** | **The "Wing" Detector.** Sets the island boundary low (3$\sigma$) to capture faint extended wings. **Use 3.0** for deep fields; **5.0** for bright-source-only catalogs. |
+| **`peak_snr_sigma`** | **5.0** | **The Noise Filter.** Rejects noise ripples. A source is only kept if its *brightest pixel* > 5$\sigma$. **Increase to 5.5** if you see too many artifacts. |
+| **`box_sizes`** | **`[50, 100, 250]`** | **Multi-Scale Background.** Estimates noise at multiple scales simultaneously. Critical for fields containing both compact sources and large diffuse galaxies. |
+| **`multicomp_area_threshold`** | **2.0** | **Hybrid Logic.** Sources smaller than this (in beam areas) are forced to be **Single Gaussians**. Prevents overfitting small blobs. |
+| **`multicomp_snr_override`** | **15.0** | **Bright Source Exception.** Allows small but bright (>15$\sigma$) sources to be split (e.g., tight double stars). |
+| **`mosaic`** | `true` | **Memory Safe.** Splits large images into tiles. **Set to `true**` for images larger than 4k x 4k. |
+
+---
+
+### 4. Output Files
+
+The pipeline generates these files in your output directory:
+
+1. **`_components.csv`**: **The Science Catalog.**
+* Contains positions (RA/DEC), Fluxes (Peak/Int), and deconvolved sizes for every fitted Gaussian. **Use this for analysis.**
+
+
+2. **`_islands.csv`**: **The Detection Catalog.**
+* Contains the raw properties of the detected "islands" (contours) before fitting. Useful for debugging dropouts.
+
+
+3. **`diagnostic_plot.png`**: A visual overlay of detections on your FITS image.
+
+### 5. Troubleshooting
+
+* **Missing Faint Sources?** Lower `detection_sigma` to `3.0`.
+* **Too Many Fake Sources?** Increase `peak_snr_sigma` to `5.5` or `6.0`.
+* **Splitting Point Sources?** Increase `multicomp_area_threshold` to `2.5`.
+* **Missed Diffuse Structure?** Add a larger box size, e.g., `[50, 100, 250, 400]`.
