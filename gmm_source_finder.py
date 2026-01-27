@@ -1,7 +1,7 @@
 '''
 Astronomy GMM Source Finder (AGSF)
 Author: Syed Faisal ur Rahman
-Version: 1.3 
+Version: 1.9 
 
 '''
 
@@ -16,7 +16,7 @@ import os
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
-from astropy.stats import SigmaClip
+from astropy.stats import SigmaClip, mad_std
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import detect_sources, SourceCatalog
@@ -36,21 +36,24 @@ except ImportError:
 
 warnings.filterwarnings('ignore')
 
-# DEFAULTS 
+# --- DEFAULTS ---
 DEFAULT_CONFIG = {
-    "output_dir": "gmm_results",
+    "output_dir": "gmm_results_optimized_v4",
     "save_plot": True,
     "mosaic": True,
     "tile_size": 2500,
     "padding": 100,
     "box_sizes": [100],
-    "detection_sigma": 5.0,
+    
+    # --- SENSITIVITY SETTINGS ---
+    "detection_sigma": 3.0,   # Detect wings (match PyBDSF)
+    "peak_snr_sigma": 5.0,    # Only keep if peak is significant (Reliability)
     "min_pix": 5,
     "n_jobs": -1,
     "exclusion_radius": 5.0,
     "max_components": 6,
     
-    # Hybrid De-blending & Dynamic Logic 
+    # --- HYBRID LOGIC ---
     "multicomp_area_threshold": 2.0,
     "multicomp_snr_override": 15.0,
     "resample_factor": 100,
@@ -58,7 +61,7 @@ DEFAULT_CONFIG = {
     "max_samples": 10000
 }
 
-# SYSTEM SETUP 
+# --- SYSTEM SETUP ---
 def setup_environment(config_path, cli_no_mosaic):
     cfg = DEFAULT_CONFIG.copy()
     if config_path and os.path.exists(config_path):
@@ -110,7 +113,7 @@ def calculate_errors(flux_peak, flux_int, maj, min, local_rms, snr):
     err_dec = min / (2*snr)
     return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
 
-# GMM FITTER 
+# --- WORKER: GMM FITTER ---
 def fit_island_worker(task):
     island_id = task['id']
     cutout = task['cutout']
@@ -121,7 +124,7 @@ def fit_island_worker(task):
     config = task['config']
     box_origin = task.get('box_origin', 0)
 
-    # Use passed RMS 
+    # Use Passed RMS (Stable)
     rms = task['rms']
     if rms == 0 or np.isnan(rms): return []
 
@@ -200,7 +203,7 @@ def fit_island_worker(task):
         gaussian_area_pix = 1.133 * maj_pix * min_pix
         peak_flux = raw_int_flux_jy / (gaussian_area_pix / beam_area)
         
-         
+        # Relaxed Post-Fit Filter (1.0 sigma)
         if peak_flux < 1.0 * rms:
             continue
 
@@ -233,6 +236,10 @@ def detect_on_data(data, wcs, config, edge_info=None):
     all_candidates = []
     h, w = data.shape
     
+    # 1. Get thresholds from Config
+    det_sigma = config.get('detection_sigma', 3.0)
+    peak_sigma = config.get('peak_snr_sigma', 5.0)
+
     for box in config['box_sizes']:
         try:
             bkg = Background2D(data, (box, box), filter_size=(3, 3),
@@ -241,13 +248,19 @@ def detect_on_data(data, wcs, config, edge_info=None):
             sub = data - bkg.background
             rms = bkg.background_rms if hasattr(bkg, 'background_rms') else bkg.rms
             
-            thresh = config['detection_sigma'] * rms
+            # 2. Detect Deep (e.g. 3.0 sigma)
+            thresh = det_sigma * rms
             segm = detect_sources(sub, thresh, npixels=config['min_pix'])
             if segm is None: continue
             
             cat = SourceCatalog(sub, segm, error=rms, wcs=wcs)
             
             for source in cat:
+                # 3. Filter Noise (Check Peak > 5.0 sigma)
+                local_rms = rms[int(source.centroid[1]), int(source.centroid[0])]
+                if source.max_value < (peak_sigma * local_rms):
+                    continue
+
                 cx, cy = source.centroid
                 if edge_info:
                     is_left, is_right, is_bottom, is_top = edge_info
@@ -272,7 +285,7 @@ def detect_on_data(data, wcs, config, edge_info=None):
                     'peak': peak_val,
                     'maj_sig': maj_sigma, 'min_sig': min_sigma, 'orient': orientation,
                     'cutout': sub[sl].copy(), 'mask': (segm.data[sl] == source.label),
-                    'rms': rms[int(cy), int(cx)], 'wcs': wcs.slice(sl),
+                    'rms': local_rms, 'wcs': wcs.slice(sl),
                     'box': box
                 }
                 all_candidates.append(cand)
