@@ -9,14 +9,12 @@ import argparse
 import numpy as np
 import warnings
 import csv
-import sys
 import gc
 import json
 import os
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
-from astropy.stats import SigmaClip, mad_std
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import detect_sources, SourceCatalog
@@ -95,22 +93,80 @@ def get_beam_info(header, pixel_scale):
     except KeyError:
         return 1.0/3600, 1.0/3600, 0.0, 1.0
 
-def deconvolve(maj, min, pa, bmaj, bmin, bpa):
-    if maj < bmaj: return 0.0, 0.0, 0.0
-    dc_maj = np.sqrt(max(0, maj**2 - bmaj**2))
-    dc_min = np.sqrt(max(0, min**2 - bmin**2))
-    return dc_maj, dc_min, pa
+def deconvolve(maj, min_ax, pa, bmaj, bmin, bpa):
+    """
+    Performs full 2D matrix deconvolution: Sigma_int = Sigma_obs - Sigma_beam.
+    Returns (dc_maj, dc_min, dc_pa) in degrees.
+    """
+    # 1. Convert inputs to Radians
+    pa_rad = np.radians(pa)
+    bpa_rad = np.radians(bpa)
+    
+    # 2. Construct Covariance Matrices (Sigma = R * S * R.T)
+    # Factor 2.355 converts FWHM to Gaussian Sigma
+    fwhm_to_sigma = 1.0 / 2.355
+    
+    def get_cov(maj_val, min_val, pa_val):
+        sigma_x = (maj_val * fwhm_to_sigma) ** 2
+        sigma_y = (min_val * fwhm_to_sigma) ** 2
+        cos_p, sin_p = np.cos(pa_val), np.sin(pa_val)
+        
+        # Rotation Matrix
+        R = np.array([[sin_p, cos_p], [-cos_p, sin_p]]) # Astronomical PA is 0 at North (Y)
+        S = np.diag([sigma_x, sigma_y])
+        return R.T @ S @ R
 
-def calculate_errors(flux_peak, flux_int, maj, min, local_rms, snr):
+    Cov_obs = get_cov(maj, min_ax, pa_rad)
+    Cov_beam = get_cov(bmaj, bmin, bpa_rad)
+    
+    # 3. Subtract Beam (Deconvolution)
+    Cov_int = Cov_obs - Cov_beam
+    
+    # 4. Check for Physical Validity (Positive Definite)
+    # If eigenvalues are negative, the source is unresolved.
+    evals, evecs = np.linalg.eigh(Cov_int)
+    
+    if np.any(evals <= 0):
+        return 0.0, 0.0, 0.0  # Unresolved
+        
+    # 5. Extract new shape parameters from intrinsic covariance
+    # Sort eigenvalues (largest is major axis)
+    order = evals.argsort()[::-1]
+    evals = evals[order]
+    evecs = evecs[:, order]
+    
+    dc_maj = np.sqrt(evals[0]) * 2.355
+    dc_min = np.sqrt(evals[1]) * 2.355
+    
+    # 6. Calculate PA from eigenvectors
+    # Astronomical PA: angle of Major axis from North (Y) toward East (X is -RA)
+    dx, dy = evecs[:, 0] # Major axis vector
+    dc_pa = np.degrees(np.arctan2(dx, dy)) % 180
+    
+    return dc_maj, dc_min, dc_pa
+
+def calculate_errors(flux_peak, flux_int, maj, min_ax, bmaj, bmin, snr):
+    """
+    Calculates errors matching Condon (1997)
+    Requires passing bmaj/bmin (beam) in addition to source params.
+    """
     if snr <= 0: return 0, 0, 0, 0, 0, 0, 0
     snr = max(snr, 0.1)
-    err_peak = flux_peak * np.sqrt((1/snr)**2 + 0.01**2)
+    
+    # Position error depends on BEAM size
+    # Factor 2 is standard approx for Gaussian fit stability
+    err_ra = bmaj / (2 * snr)
+    err_dec = bmin / (2 * snr)
+    
+    # Flux errors (Condon)
+    err_peak = flux_peak * np.sqrt((1/snr)**2 + 0.01**2) # 1% calibration error added
     err_int = flux_int * np.sqrt((1/snr)**2 + 0.01**2)
+    
+    # Shape errors usually scale with source size
     err_maj = maj / snr
-    err_min = min / snr
+    err_min = min_ax / snr
     err_pa = 10.0 / snr
-    err_ra = maj / (2*snr)
-    err_dec = min / (2*snr)
+    
     return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
 
 # --- WORKER: GMM FITTER ---
@@ -209,7 +265,7 @@ def fit_island_worker(task):
 
         snr = peak_flux / rms
         dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
-        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, rms, snr)
+        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, bmaj,bmin, snr)
 
         try:
             sky = wcs_slice.pixel_to_world(mx, my)
@@ -364,7 +420,7 @@ def process_candidates(cands, beam, scale, config, f_isl, f_comp, group_id, appe
         local_rms = cand['rms']
         
         isl_snr = peak_flux_jy / local_rms
-        errs = calculate_errors(peak_flux_jy, total_flux_jy, maj_deg, min_deg, local_rms, isl_snr)
+        errs = calculate_errors(peak_flux_jy, total_flux_jy, maj_deg, min_deg, bmaj,bmin, isl_snr)
 
         island_list.append({
             'Island_id': uid, 
