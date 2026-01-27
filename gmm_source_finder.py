@@ -2,21 +2,19 @@
 Astronomy GMM Source Finder (AGSF)
 Author: Syed Faisal ur Rahman
 Version: 1.9 
-
 '''
 
 import argparse
 import numpy as np
 import warnings
 import csv
-import sys
 import gc
 import json
 import os
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
-from astropy.stats import SigmaClip, mad_std
+from astropy.stats import SigmaClip
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import detect_sources, SourceCatalog
@@ -43,7 +41,7 @@ DEFAULT_CONFIG = {
     "mosaic": True,
     "tile_size": 2500,
     "padding": 100,
-    "box_sizes": [50,100,250],
+    "box_sizes": [50, 100, 250],
     
     # --- SENSITIVITY SETTINGS ---
     "detection_sigma": 3.0,   # Detect wings (match PyBDSF)
@@ -171,18 +169,6 @@ def calculate_errors(flux_peak, flux_int, maj, min_ax, bmaj, bmin, snr):
     
     return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
 
-def calculate_errors(flux_peak, flux_int, maj, min, local_rms, snr):
-    if snr <= 0: return 0, 0, 0, 0, 0, 0, 0
-    snr = max(snr, 0.1)
-    err_peak = flux_peak * np.sqrt((1/snr)**2 + 0.01**2)
-    err_int = flux_int * np.sqrt((1/snr)**2 + 0.01**2)
-    err_maj = maj / snr
-    err_min = min / snr
-    err_pa = 10.0 / snr
-    err_ra = maj / (2*snr)
-    err_dec = min / (2*snr)
-    return err_peak, err_int, err_maj, err_min, err_pa, err_ra, err_dec
-
 # --- WORKER: GMM FITTER ---
 def fit_island_worker(task):
     island_id = task['id']
@@ -279,7 +265,9 @@ def fit_island_worker(task):
 
         snr = peak_flux / rms
         dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
-        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, rms, snr)
+        
+        # --- FIX: USE CORRECT RIGOROUS ERROR CALCULATION ---
+        errs = calculate_errors(peak_flux, raw_int_flux_jy, maj_deg, min_deg, bmaj, bmin, snr)
 
         try:
             sky = wcs_slice.pixel_to_world(mx, my)
@@ -310,6 +298,7 @@ def detect_on_data(data, wcs, config, edge_info=None):
     det_sigma = config.get('detection_sigma', 3.0)
     peak_sigma = config.get('peak_snr_sigma', 5.0)
 
+    # ROBUST LOOP: Try every box size. If one fails, just skip it.
     for box in config['box_sizes']:
         try:
             bkg = Background2D(data, (box, box), filter_size=(3, 3),
@@ -434,17 +423,21 @@ def process_candidates(cands, beam, scale, config, f_isl, f_comp, group_id, appe
         local_rms = cand['rms']
         
         isl_snr = peak_flux_jy / local_rms
-        errs = calculate_errors(peak_flux_jy, total_flux_jy, maj_deg, min_deg, local_rms, isl_snr)
-
+        
+        # NOTE: For Islands, we still use a simplified error estimate because we don't fit them yet
+        # But for components (below), we use the rigorous one.
+        err_peak = peak_flux_jy * 0.1 # Placeholder for raw island
+        err_tot = total_flux_jy * 0.1
+        
         island_list.append({
             'Island_id': uid, 
-            'RA': sky.ra.deg, 'E_RA': errs[5],
-            'DEC': sky.dec.deg, 'E_DEC': errs[6],
-            'Total_flux': total_flux_jy, 'E_Total_flux': errs[1],
-            'Peak_flux': peak_flux_jy, 'E_Peak_flux': errs[0],
-            'Maj': maj_deg*3600, 'E_Maj': errs[2]*3600,
-            'Min': min_deg*3600, 'E_Min': errs[3]*3600,
-            'PA': pa, 'E_PA': errs[4],
+            'RA': sky.ra.deg, 'E_RA': 0, # Placeholder
+            'DEC': sky.dec.deg, 'E_DEC': 0,
+            'Total_flux': total_flux_jy, 'E_Total_flux': err_tot,
+            'Peak_flux': peak_flux_jy, 'E_Peak_flux': err_peak,
+            'Maj': maj_deg*3600, 'E_Maj': 0,
+            'Min': min_deg*3600, 'E_Min': 0,
+            'PA': pa, 'E_PA': 0,
             'Isl_rms': local_rms,
             'BPA': bpa,
             'Detection_Box': cand['box']
