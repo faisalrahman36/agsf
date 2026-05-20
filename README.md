@@ -21,7 +21,7 @@ The author acknowledges the assistance of multiple large language models (LLMs) 
 
 If using this then please cite:
 
-**Rahman, S. F., Vardoulaki, E. (2025).** *AGSF: A  Probabilistic Source Finding Pipeline for Radio Interferometry using Gaussian Mixture Model (GMM). (In preparation)*.
+**Rahman, S. F., Vardoulaki, E. (2026).** *AGSF: A  Probabilistic Source Finding Pipeline for Radio Interferometry using Gaussian Mixture Model (GMM). (In preparation)*.
 
 Please add link to this repo [https://github.com/faisalrahman36/agsf] too in citation.
 
