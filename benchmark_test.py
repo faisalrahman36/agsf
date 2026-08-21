@@ -1,8 +1,8 @@
 '''
-AGSF vs PyBDSF Benchmark 
+AGSF vs PyBDSF Benchmark
+Compares Component-to-Gaussian performance.
 '''
 import os
-import sys
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -17,12 +17,17 @@ from astropy.visualization import ZScaleInterval, ImageNormalize
 import json
 
 # Import GMM code
-import gmm_source_finder as gmm_tool
+import gmm_source_finder_optimized_v7 as gmm_tool
 
 # --- CONFIGURATION ---
-FITS_FILE = "cosmos144MHz_zoom.fits"
-OUTPUT_DIR = "benchmark_final"
-CONFIG_FILE = "config.json"
+#FITS_FILE = "cosmos144MHz_zoom.fits"
+#FITS_FILE= "image_fullband.int.restored_3GHz.fits"
+FITS_FILE= "sim_field.fits"
+#OUTPUT_DIR = "benchmark_Eleni3GHz_gmmv7"
+OUTPUT_DIR = "benchmark_sim_field_gmm7_conf5"
+CONFIG_FILE = "config5.json"
+print(FITS_FILE, CONFIG_FILE, OUTPUT_DIR)
+print("abc123")
 
 def setup_dirs():
     if not os.path.exists(OUTPUT_DIR):
@@ -48,6 +53,12 @@ def run_pybdsf_gaussians(fits_path):
         # Export 'gaul' (Gaussians) for GMM components comparison
         gau_file = os.path.join(OUTPUT_DIR, "pybdsf_gaussians.csv")
         img.write_catalog(outfile=gau_file, catalog_type='gaul', format='csv', clobber=True)
+        
+        #sources or srl for GMM islands comparison
+        srl_file = os.path.join(OUTPUT_DIR, "pybdsf_sources.csv")
+
+        img.write_catalog(outfile=srl_file, format='csv', catalog_type='srl')
+        
         
         print(f"PyBDSF Found: {img.nsrc} Sources, {len(img.gaussians)} Gaussians")
         return gau_file
@@ -75,7 +86,7 @@ def run_gmm_full(fits_path):
     wcs = WCS(header).celestial
     if data.ndim > 2: data = data[0] if data.ndim == 3 else data[0,0]
     
-    # Robust Pixel Scale
+    # Pixel Scale
     pix_scales = proj_plane_pixel_scales(wcs)
     pscale = pix_scales[0] # Degrees
     
@@ -87,8 +98,8 @@ def run_gmm_full(fits_path):
     if cfg.get('mosaic', True):
         gmm_tool.run_mosaic(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
     else:
-        gmm_tool.run_standard(data, wcs, beam, pscale, cfg, f_isl, f_comp, OUTPUT_DIR)
-    
+        cands, _ = gmm_tool.detect_on_data(data, wcs, cfg)
+        gmm_tool.process_candidates(cands, beam, pscale, cfg, f_isl, f_comp, "FullFrame")
     return f_comp
 
 # --- 3. COMPARISON & PLOTTING ---
@@ -96,7 +107,7 @@ def compare_catalogs(gmm_path, pyb_path, fits_path):
     print(f"\n--- Comparing Catalogs ---")
     gmm = pd.read_csv(gmm_path)
     
-    # Robust PyBDSF Reader (Handles comments/headers)
+    # PyBDSF Reader (Handles comments/headers)
     try:
         # Find header line starting with "Source_id" or "Gaus_id"
         header_row = 0
@@ -150,7 +161,7 @@ def plot_overlay(gmm, pyb, fits_path):
         wcs = WCS(header).celestial
         if data.ndim > 2: data = data[0] if data.ndim == 3 else data[0,0]
 
-    # Robust scale factor
+    # scale factor
     pix_scales = proj_plane_pixel_scales(wcs)
     deg_per_pix = pix_scales[0]
 
