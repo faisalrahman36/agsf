@@ -1,7 +1,7 @@
 '''
 Astronomy GMM Source Finder (AGSF)
 Author: Syed Faisal ur Rahman
-Version: 3 
+Version: 5 
 '''
 
 import argparse
@@ -18,7 +18,7 @@ from astropy.stats import SigmaClip
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from photutils.background import Background2D, MedianBackground
 from photutils.segmentation import detect_sources, SourceCatalog
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import map_coordinates, binary_dilation
 import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 from sklearn.mixture import GaussianMixture
@@ -34,18 +34,24 @@ DEFAULT_CONFIG = {
     "tile_size": 2500,
     "padding": 100,
     "box_sizes": [50, 150, 400],
-    "detection_sigma": 3.0,     # PyBDSF-style 3-sigma internal sub-component limit
-    "peak_snr_sigma": 5.0,      # Strict 5-sigma global island limit
+    "detection_sigma": 3.0,     
+    "peak_snr_sigma": 5.0,      
     "min_pix": 12,
     "n_jobs": -1,
     "exclusion_radius": 5.0,
     "max_components": 6,
-    "multicomp_area_threshold": 3.0,
-    "multicomp_snr_override": 15.0,
+    "bic_split_threshold": 10.0,
     "resample_factor": 100,
     "min_samples": 500,
     "max_samples": 10000,
-    "resolved_sigma_threshold":2.5
+    "resolved_sigma_threshold": 2.5,
+    # --- OPTIONAL FEATURE TOGGLES ---
+    "enable_curve_of_growth": True,
+    "curve_of_growth_clamp": 0.9,
+    "decouple_spatial_mask": True,
+    "enable_purity_filter": True,
+    "continuous_morphology": True,
+    "iterative_deduplication": True
 }
 
 _GAUSS_AREA_K = np.pi / (4.0 * np.log(2.0))
@@ -72,7 +78,6 @@ def get_beam_info(header, pixel_scale):
         return 1.0/3600, 1.0/3600, 0.0, 1.0
 
 def deconvolve(maj, min_ax, pa, bmaj, bmin, bpa):
-    """Astronomical PA matrix convention (North through East)."""
     pa_rad = np.radians(pa)
     bpa_rad = np.radians(bpa)
     fwhm_to_sigma = 1.0 / 2.355
@@ -97,10 +102,6 @@ def deconvolve(maj, min_ax, pa, bmaj, bmin, bpa):
     return dc_maj, dc_min, dc_pa
 
 def calculate_errors(fp, fi, maj, min_ax, pa, bmaj, bmin, snr):
-    """
-    Condon (1997) analytical errors using Effective SNR.
-    FIX: Now accepts 'pa' to project positional errors isotropically.
-    """
     snr = max(snr, 0.1)
     rho_sq = max((maj * min_ax / (bmaj * bmin)) * (snr**2), 1.0) 
 
@@ -114,7 +115,6 @@ def calculate_errors(fp, fi, maj, min_ax, pa, bmaj, bmin, snr):
         epa_rad = np.sqrt(4.0 / rho_sq) * (maj * min_ax / denom)
         epa = min(np.degrees(epa_rad), 90.0) 
 
-    # Astrometric Fix: Project axes onto RA/DEC grid using PA
     pos_factor = np.sqrt(rho_sq * 8.0 * np.log(2.0))
     e_maj_axis = maj / pos_factor
     e_min_axis = min_ax / pos_factor
@@ -123,7 +123,6 @@ def calculate_errors(fp, fi, maj, min_ax, pa, bmaj, bmin, snr):
     era = np.sqrt((e_maj_axis * np.sin(pa_rad))**2 + (e_min_axis * np.cos(pa_rad))**2)
     edec = np.sqrt((e_maj_axis * np.cos(pa_rad))**2 + (e_min_axis * np.sin(pa_rad))**2)
 
-    # 1% calibration floor added to empirical photometric errors
     ep = fp * np.sqrt(2.0 / rho_sq + 0.01**2)
     ei = fi * np.sqrt(2.0 / rho_sq + (em / maj)**2 + (en / min_ax)**2 + 0.01**2)
 
@@ -143,23 +142,30 @@ def fit_island_worker(task):
     if rms == 0 or np.isnan(rms):
         return []
 
-    valid = (mask) & (~np.isnan(cutout))
-    y, x = np.indices(cutout.shape)
-    flux_vals = cutout[valid]
-    
+    valid_flux = (mask) & (~np.isnan(cutout))
+    flux_vals = cutout[valid_flux]
     if len(flux_vals) < 5 or np.sum(flux_vals) <= 0:
         return []
 
-    X = np.vstack([x[valid], y[valid]]).T
     bmaj, bmin, bpa, beam_area = beam
-    
-    # Physical flux in this island for Top-Down partitioning
     island_flux_total = np.sum(flux_vals) / beam_area
 
-    # Stochastic Sampling 
-    prob = flux_vals / np.sum(flux_vals)
-    prob = np.clip(prob, 0, None)
-    prob /= np.sum(prob)
+    # CONFIG: Decoupled Masks
+    if config.get('decouple_spatial_mask', True):
+        astrometry_mask = binary_dilation(mask, iterations=3)
+        valid_spatial = astrometry_mask & (~np.isnan(cutout))
+    else:
+        valid_spatial = valid_flux
+    
+    y, x = np.indices(cutout.shape)
+    spatial_vals = cutout[valid_spatial]
+    X = np.vstack([x[valid_spatial], y[valid_spatial]]).T
+    
+    prob = np.clip(spatial_vals, 0, None)
+    sum_prob = np.sum(prob)
+    if sum_prob == 0:
+        return []
+    prob /= sum_prob
     
     n_samples = int(np.sum(flux_vals) * config.get('resample_factor', 100))
     n_samples = min(max(n_samples, config.get('min_samples', 500)), config.get('max_samples', 10000))
@@ -169,28 +175,24 @@ def fit_island_worker(task):
     except ValueError:
         return []
 
-    island_snr = np.max(flux_vals) / rms
-    lim_t = config.get('multicomp_area_threshold', 3.0) * beam_area
-    max_comp = config['max_components'] if (len(flux_vals) >= lim_t or island_snr >= 15.0) else 1
-
-    # Physical pixels effective sample size for BIC
-    n_eff = max(len(X) / beam_area, 1.0)
-
     best_bic = np.inf
     best_gmm = None
+    bic_threshold = config.get('bic_split_threshold', 10.0)
 
-    for n in range(1, max_comp + 1):
+    for n in range(1, config['max_components'] + 1):
         try:
             gmm = GaussianMixture(n_components=n, covariance_type='full', 
                                   reg_covar=1e-6, random_state=42, n_init=3)
             gmm.fit(X_resampled)
-            
-            # Re-scale the log-likelihood to physical pixels to allow aggressive deblending
             cur_bic = gmm.bic(X_resampled)
 
-            if cur_bic < best_bic:
+            if n == 1:
                 best_bic = cur_bic
                 best_gmm = gmm
+            else:
+                if cur_bic < best_bic - bic_threshold:
+                    best_bic = cur_bic
+                    best_gmm = gmm
         except Exception as e:
             continue
 
@@ -198,6 +200,8 @@ def fit_island_worker(task):
         return []
 
     comps = []
+    threshold_level = config.get('detection_sigma', 3.0) * rms
+
     for i in range(best_gmm.n_components):
         mx, my = best_gmm.means_[i]
         vals, vecs = np.linalg.eigh(best_gmm.covariances_[i])
@@ -206,34 +210,51 @@ def fit_island_worker(task):
         maj_deg = np.sqrt(vals[order[0]]) * 2.355 * pix_scale
         min_deg = np.sqrt(vals[order[1]]) * 2.355 * pix_scale
         pa = np.degrees(np.arctan2(vecs[0, order[0]], vecs[1, order[0]])) % 180
-
         cw = best_gmm.weights_[i]
-        dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
 
-        # TOP-DOWN 
-        int_f = island_flux_total * cw
-        snr_est = int_f / rms if rms > 0 else 0.1
+        comp_peak_intensity = map_coordinates(cutout, [[my], [mx]], order=1)[0]
         
-        resolved_sigma_threshold = config["resolved_sigma_threshold"]
-        # Condon Resolution Envelope
-        rho_sq_est = max((maj_deg * min_deg / (bmaj * bmin)) * (snr_est**2), 1.0)
-        sigma_maj_est = maj_deg * np.sqrt(2.0 / rho_sq_est)
-        is_resolved_maj = maj_deg >= (bmaj + resolved_sigma_threshold * sigma_maj_est)
+        # CONFIG: Purity Filter
+        if config.get('enable_purity_filter', True):
+            if comp_peak_intensity < threshold_level:
+                continue
 
-        # Derive Peak Flux mathematically to prevent ghost components
-        if not is_resolved_maj or min_deg < bmin or dc_maj == 0.0:
-            maj_deg, min_deg, pa = bmaj, bmin, bpa
-            dc_maj, dc_min, dc_pa = 0.0, 0.0, 0.0
-            peak_f_comp = int_f  
+        # CONFIG: Curve of Growth Flux Correction
+        if config.get('enable_curve_of_growth', True):
+            clamp = config.get('curve_of_growth_clamp', 0.9)
+            if comp_peak_intensity > 0:
+                ratio = min(threshold_level / comp_peak_intensity, clamp)
+            else:
+                ratio = clamp
+            curve_of_growth_factor = 1.0 / (1.0 - ratio)
         else:
+            curve_of_growth_factor = 1.0
+
+        int_f = island_flux_total * cw * curve_of_growth_factor
+        snr_est = int_f / rms if rms > 0 else 0.1
+
+        # CONFIG: Continuous Morphology vs Binary Point-Source Snapping
+        if config.get('continuous_morphology', True):
+            maj_deg = max(maj_deg, bmaj)
+            min_deg = max(min_deg, bmin)
+            dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
             g_area_pixels = _GAUSS_AREA_K * (maj_deg / pix_scale) * (min_deg / pix_scale)
             peak_f_comp = int_f * (beam_area / g_area_pixels)
+        else:
+            rho_sq_est = max((maj_deg * min_deg / (bmaj * bmin)) * (snr_est**2), 1.0)
+            sigma_maj_est = maj_deg * np.sqrt(2.0 / rho_sq_est)
+            resolved_sigma_threshold = config.get("resolved_sigma_threshold", 2.5)
+            is_resolved_maj = maj_deg >= (bmaj + resolved_sigma_threshold * sigma_maj_est)
 
-        #  sub-component threshold (3-sigma as default)
-        if peak_f_comp < config.get('detection_sigma', 3.0) * rms:
-            continue
+            if not is_resolved_maj or min_deg < bmin:
+                maj_deg, min_deg, pa = bmaj, bmin, bpa
+                dc_maj, dc_min, dc_pa = 0.0, 0.0, 0.0
+                peak_f_comp = int_f  
+            else:
+                dc_maj, dc_min, dc_pa = deconvolve(maj_deg, min_deg, pa, bmaj, bmin, bpa)
+                g_area_pixels = _GAUSS_AREA_K * (maj_deg / pix_scale) * (min_deg / pix_scale)
+                peak_f_comp = int_f * (beam_area / g_area_pixels)
 
-        # Pass 'pa' into calculate_errors for RA/DEC projection
         errs = calculate_errors(peak_f_comp, int_f, maj_deg, min_deg, pa, bmaj, bmin, snr_est)
 
         try:
@@ -292,7 +313,7 @@ def process_candidates(cands, beam, scale, config, f_isl, f_comp, group_id, appe
         pa_v = (90 - np.degrees(cand['orient'])) % 180 if not np.isnan(cand['orient']) else 0.0
         
         island_list.append({
-            'Island_id': uid, 'RA': ra_avg, 'E_RA': e_ra, 'DEC': dec_avg, 'E_DEC': e_dec,
+            'Island_id': uid, 'N_components': len(isl_comps), 'RA': ra_avg, 'E_RA': e_ra, 'DEC': dec_avg, 'E_DEC': e_dec,
             'Total_flux': tot_f, 'E_Total_flux': np.sqrt(sum([c['E_Total_flux']**2 for c in isl_comps])),
             'Peak_flux': max([c['Peak_flux'] for c in isl_comps]), 'E_Peak_flux': max([c['E_Peak_flux'] for c in isl_comps]),
             'Maj': (maj_v*2.355*scale)*3600, 'Min': (min_v*2.355*scale)*3600, 'PA': pa_v,
@@ -357,8 +378,13 @@ def run_mosaic(data, full_wcs, beam, scale, config, f_isl, f_comp, out_dir):
     h, w = data.shape
     all_comps = []
     
-    open(f_isl, 'a').close()
-    open(f_comp, 'a').close()
+    for f_path in [f_isl, f_comp]:
+        if os.path.exists(f_path):
+            os.remove(f_path)
+    with open(f_isl, 'w', newline='') as f:
+        csv.writer(f).writerow(['Island_id', 'N_components', 'RA', 'E_RA', 'DEC', 'E_DEC', 'Total_flux', 'E_Total_flux', 'Peak_flux', 'E_Peak_flux', 'Maj', 'Min', 'PA', 'Isl_rms', 'Detection_Box'])
+    with open(f_comp, 'w', newline='') as f:
+        csv.writer(f).writerow(['Island_id', 'RA', 'E_RA', 'DEC', 'E_DEC', 'Total_flux', 'E_Total_flux', 'Peak_flux', 'E_Peak_flux', 'Maj', 'E_Maj', 'Min', 'E_Min', 'PA', 'E_PA', 'DC_Maj', 'DC_Min', 'DC_PA', 'RMS', 'S_Code', 'Detection_Box'])
     
     for y in range(0, h, ts):
         for x in range(0, w, ts):
@@ -381,10 +407,13 @@ def run_mosaic(data, full_wcs, beam, scale, config, f_isl, f_comp, out_dir):
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("fits_file")
-    p.add_argument("--prefix", default="gmm")
+    p.add_argument("--prefix", default=None, help="Output file prefix (defaults to FITS filename)")
     p.add_argument("--config", default="config.json")
     p.add_argument("--no-mosaic", action="store_true")
     args = p.parse_args()
+
+    if args.prefix is None:
+        args.prefix = os.path.splitext(os.path.basename(args.fits_file))[0]
 
     cfg, out_dir = setup_environment(args.config, args.no_mosaic)
 
@@ -392,11 +421,8 @@ if __name__ == "__main__":
     header = hdul[0].header
     data = np.squeeze(hdul[0].data)
     wcs = WCS(header).celestial
-    
 
-    # --- METADATA CHECK BLOCK ---
     freq_hz = None
-    # Check common FITS keywords for frequency (Rest Frequency or 3rd Axis)
     for key in ['RESTFRQ', 'RESTFREQ', 'CRVAL3']:
         if key in header:
             freq_hz = header[key]
@@ -408,11 +434,11 @@ if __name__ == "__main__":
     if freq_hz:
         freq_mhz = freq_hz / 1e6
         print(f"Header Frequency Detected: {freq_mhz:.3f} MHz")
-        
+        if "3ghz" in args.fits_file.lower() and freq_mhz < 500:
+            print("[!] CRITICAL WARNING: Filename implies 3 GHz but FITS header reports ~145 MHz!")
     else:
         print("[!] WARNING: Could not detect Rest Frequency in FITS header.")
     print("="*50 + "\n")
-    # -------------------------------------
     
     if data.ndim > 2:
         data = data[0] if data.ndim == 3 else data[0, 0]
@@ -431,8 +457,12 @@ if __name__ == "__main__":
     f_isl = os.path.join(out_dir, f"{args.prefix}_islands.csv")
     f_comp = os.path.join(out_dir, f"{args.prefix}_components.csv")
     
+    for f_path in [f_isl, f_comp]:
+        if os.path.exists(f_path):
+            os.remove(f_path)
+            
     with open(f_isl, 'w', newline='') as f:
-        csv.writer(f).writerow(['Island_id', 'RA', 'E_RA', 'DEC', 'E_DEC', 'Total_flux', 'E_Total_flux', 'Peak_flux', 'E_Peak_flux', 'Maj', 'Min', 'PA', 'Isl_rms', 'Detection_Box'])
+        csv.writer(f).writerow(['Island_id', 'N_components', 'RA', 'E_RA', 'DEC', 'E_DEC', 'Total_flux', 'E_Total_flux', 'Peak_flux', 'E_Peak_flux', 'Maj', 'Min', 'PA', 'Isl_rms', 'Detection_Box'])
     with open(f_comp, 'w', newline='') as f:
         csv.writer(f).writerow(['Island_id', 'RA', 'E_RA', 'DEC', 'E_DEC', 'Total_flux', 'E_Total_flux', 'Peak_flux', 'E_Peak_flux', 'Maj', 'E_Maj', 'Min', 'E_Min', 'PA', 'E_PA', 'DC_Maj', 'DC_Min', 'DC_PA', 'RMS', 'S_Code', 'Detection_Box'])
 
@@ -446,49 +476,39 @@ if __name__ == "__main__":
             
     hdul.close()
 
-    # deduplication
     try:
-        
-        
-        def global_deduplicate(file_path, exclusion_radius_arcsec):
-            print(f"\n[+] Running global cross-tile deduplication on {os.path.basename(file_path)}...")
+        def global_deduplicate(file_path, exclusion_radius_arcsec, is_iterative):
+            print(f"\n[+] Running {'iterative ' if is_iterative else ''}global cross-tile deduplication on {os.path.basename(file_path)}...")
             df = pd.read_csv(file_path)
-            initial_count = len(df)
+            if len(df) < 2: return
             
-            if initial_count < 2:
-                return
+            while True:
+                initial_count = len(df)
+                coords = SkyCoord(ra=df['RA'].values, dec=df['DEC'].values, unit='deg')
+                idx, d2d, _ = match_coordinates_sky(coords, coords, nthneighbor=2)
                 
-            # Match catalog to itself using astropy's 2nd nearest neighbor (1st is itself)
-            coords = SkyCoord(ra=df['RA'].values, dec=df['DEC'].values, unit='deg')
-            idx, d2d, _ = match_coordinates_sky(coords, coords, nthneighbor=2)
-            
-            keep = np.ones(initial_count, dtype=bool)
-            
-            # Iterate through any matches closer than the exclusion radius
-            for j in np.where(d2d.arcsec < exclusion_radius_arcsec)[0]:
-                partner = idx[j]
-                # If both are still flagged to be kept, a duplicate overlap exists
-                if keep[j] and keep[partner]:
-                    # Keep the fragment with the higher Peak_flux, drop the duplicate
-                    if df['Peak_flux'].iloc[j] < df['Peak_flux'].iloc[partner]:
-                        keep[j] = False
-                    else:
-                        keep[partner] = False
-                        
-            df_cleaned = df[keep]
-            final_count = len(df_cleaned)
-            df_cleaned.to_csv(file_path, index=False)
-            print(f"[SUCCESS] Removed {initial_count - final_count} overlapping mosaic duplicates. Final count: {final_count}")
+                keep = np.ones(initial_count, dtype=bool)
+                for j in np.where(d2d.arcsec < exclusion_radius_arcsec)[0]:
+                    partner = idx[j]
+                    if keep[j] and keep[partner]:
+                        if df['Peak_flux'].iloc[j] < df['Peak_flux'].iloc[partner]:
+                            keep[j] = False
+                        else:
+                            keep[partner] = False
+                            
+                df = df[keep].reset_index(drop=True)
+                
+                # CONFIG: Iterative Deduplication
+                if not is_iterative or len(df) == initial_count:
+                    break
+                
+            df.to_csv(file_path, index=False)
+            print(f"[SUCCESS] Final deduplicated count: {len(df)}")
 
-        # Execute deduplication using the config exclusion radius converted to arcseconds
-        dedup_radius_arcsec = cfg['exclusion_radius'] * pscale * 3600
-        
-        global_deduplicate(f_comp, dedup_radius_arcsec)
-        global_deduplicate(f_isl, dedup_radius_arcsec)
+        dedup_radius_arcsec = cfg.get('global_dedup_radius_arcsec', cfg['exclusion_radius'] * pscale * 3600)
+        iterative_dedup = cfg.get('iterative_deduplication', True)
+        global_deduplicate(f_comp, dedup_radius_arcsec, iterative_dedup)
+        global_deduplicate(f_isl, dedup_radius_arcsec, iterative_dedup)
         
     except ImportError:
-        print("[!] Error: 'pandas' is not installed. Global deduplication skipped. Run 'pip install pandas'.")
-    except Exception as e:
-        print(f"[!] CRITICAL ERROR during deduplication: {e}")
-        print("[!] Proceeding without deduplication. Output catalog may contain flux-inflated mosaic boundary duplicates.")
-    
+        print("[!] Error: 'pandas' is not installed. Global deduplication skipped.")

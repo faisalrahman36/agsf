@@ -1,6 +1,6 @@
 '''
 AGSF vs PyBDSF Benchmark
-Compares Component-to-Gaussian performance.
+Compares Gaussian-to-Gaussian performance.
 '''
 import os
 import numpy as np
@@ -17,15 +17,12 @@ from astropy.visualization import ZScaleInterval, ImageNormalize
 import json
 
 # Import GMM code
-import gmm_source_finder_optimized_v7 as gmm_tool
+import gmm_source_finder as gmm_tool
 
 # --- CONFIGURATION ---
-#FITS_FILE = "cosmos144MHz_zoom.fits"
-#FITS_FILE= "image_fullband.int.restored_3GHz.fits"
 FITS_FILE= "sim_field.fits"
-#OUTPUT_DIR = "benchmark_Eleni3GHz_gmmv7"
-OUTPUT_DIR = "benchmark_sim_field_gmm7_conf5"
-CONFIG_FILE = "config5.json"
+OUTPUT_DIR = "benchmark_sim_field"
+CONFIG_FILE = "config.json"
 print(FITS_FILE, CONFIG_FILE, OUTPUT_DIR)
 print("abc123")
 
@@ -107,7 +104,7 @@ def compare_catalogs(gmm_path, pyb_path, fits_path):
     print(f"\n--- Comparing Catalogs ---")
     gmm = pd.read_csv(gmm_path)
     
-    # PyBDSF Reader (Handles comments/headers)
+    # Robust PyBDSF Reader (Handles comments/headers)
     try:
         # Find header line starting with "Source_id" or "Gaus_id"
         header_row = 0
